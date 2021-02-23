@@ -1,4 +1,6 @@
 #include <stdio.h>
+#include <stdbool.h>
+#include <stdlib.h>
 
 /* ******************************************************************
  ALTERNATING BIT AND GO-BACK-N NETWORK EMULATOR: VERSION 1.1  J.F.Kurose
@@ -35,7 +37,64 @@ struct pkt {
     };
 
 /********* STUDENTS WRITE THE NEXT SEVEN ROUTINES *********/
+bool pktintransit;              /* Boolean to test whether link is open    */
+struct pkt pktsend;             /* Packet structure to be sent             */
+struct pkt response;            /* NACK or ACK to be sent back             */
+int globalseqnum;               /* Global var to track seqnum              */
+int totalpackets;               /* Global var to track packets sent        */
 
+
+
+/* Simple wraparound function for summing two 8 bit integers */
+int wraparound(wrapsum) {
+  int carry = (wrapsum > 255) ? 1 : 0;
+  return ((wrapsum % 256) + carry);
+}
+
+
+/* helper function that returns a checksum for a provided packet */
+int calc_checksum(packet) 
+  struct pkt packet;
+{
+  int sum = 0;
+
+  sum += packet.seqnum + packet.acknum;
+  sum = wraparound(sum);
+
+  for (int i=0; i<20; i++) {    
+    sum += packet.payload[i];
+    sum = wraparound(sum);
+  }
+
+  sum = ~sum;     /* convert to one's compliment */
+  return sum;  
+}
+
+
+
+/* helper function that tests whether checksum passes */
+int test_checksum(packet) 
+  struct pkt packet;
+{
+  int sum = 0;
+
+  sum += packet.seqnum + packet.acknum;
+  sum = wraparound(sum);
+
+  sum += packet.checksum;
+  sum = wraparound(sum);
+
+  for (int i=0; i<20; i++) {    
+    sum += packet.payload[i];
+    sum = wraparound(sum);
+  }
+
+  if (sum == 254) {  /* Checksum passes, would return -1 but set-up so it should return 255 - 1; return true */
+    return true;
+  } else {
+    return false;
+  }
+}
 
 
 
@@ -43,32 +102,78 @@ struct pkt {
 A_output(message)
   struct msg message;
 {
+  totalpackets ++;
+
+  if (pktintransit) {      /* packet is outstanding, drop message */ 
+    printf("Packet %d dropped in transfer to layer 3 \n", totalpackets);
+  }
+  else {                   /* link is open, prepare to send packet */
+    printf("Packet %d being written \n", globalseqnum);
+    
+    for (int i=0; i<20; i++) {     /* fill sending packet with message data */
+      pktsend.payload[i] = message.data[i];
+    }
+
+    pktsend.seqnum = globalseqnum;   /* increment seqnum */
+    pktsend.checksum = calc_checksum(pktsend);
+    
+    pktintransit = true;
+    tolayer3(0, pktsend);
+    starttimer(0, 40.0);    /* Start time to watch for packet loss, timeout at 4x RTT */
+  }
 
 }
 
 B_output(message)  /* need be completed only for extra credit */
   struct msg message;
 {
-
+  
 }
 
 /* called from layer 3, when a packet arrives for layer 4 */
 A_input(packet)
   struct pkt packet;
 {
+  if (packet.acknum == 0 || !test_checksum(packet)) {    /* NACK received or response is corrupted --> retransmit message */
 
+    stoptimer(0); /* Stop timer, will restart if retransmitting or on next packet */
+
+    printf("Packet %d NACK received, retransmitting \n", packet.seqnum);
+    
+    for (int i=0; i<20; i++) {                   /* Rewrite the packet with the right data */
+      packet.payload[i] = pktsend.payload[i];
+    }
+    packet.checksum = calc_checksum(packet);
+
+
+    tolayer3(0, pktsend);
+    starttimer(0, 40.0); /* Start time to watch for packet loss, timeout at 4x RTT */
+  } 
+  else {       /* ACK received, increment seqnum and enable new messages */
+
+    stoptimer(0); /* Stop timer, will restart if retransmitting or on next packet */
+
+    printf("Packet %d ACK received \n", packet.seqnum);
+    globalseqnum ++;
+    pktintransit = false;
+  }
 }
 
-/* called when A's timer goes off */
+/* called when A's timer goes off, retransmit packet */
 A_timerinterrupt()
 {
-
+  printf("Packet %d timed-out, retransmitting \n", globalseqnum);
+  tolayer3(0, pktsend);
+  starttimer(0, 40.0);   /* Start time to watch for packet loss, timeout at 4x RTT */
 }  
 
 /* the following routine will be called once (only) before any other */
 /* entity A routines are called. You can use it to do any initialization */
 A_init()
 {
+  pktintransit = false;
+  globalseqnum = 1;
+  totalpackets = 0;
 }
 
 
@@ -78,12 +183,38 @@ A_init()
 B_input(packet)
   struct pkt packet;
 {
+  
+  for(int i=0; i<20; i++) {     /* Copy over the payload to ACK for passing back                 */
+      response.payload[i] = packet.payload[i];
+    }
+  response.seqnum = packet.seqnum;   /* Set ack seqnum equal to packet seqnum */
+
+
+  if (!test_checksum(packet)) {      /* Checksum does not pass, respond with NACK */
+    printf("Packet %d corrupted at Host B, responding with NACK \n", packet.seqnum);
+  
+    response.acknum = 0;    /* Assign response an acknum of 0 to denote that it is a NACK */
+    response.checksum = calc_checksum(response);
+
+    tolayer3(1, response);  /* Respond with NACK */
+  }
+  else {  /* On correct receipt, respond with ACK and send to layer 5 */
+    printf("Packet %d received by Host B \n", packet.seqnum);
+    
+    response.acknum = 1;    /* Assign response an acknum of 1 to denote that it is an ACK, not a NACK */
+    packet.acknum = 1;      /* Assign acknum 1 so application layer knows it was correctly received */
+    response.checksum = calc_checksum(response);
+
+    tolayer5(1,packet.payload);
+    tolayer3(1, response);
+  }
 }
 
 /* called when B's timer goes off */
 B_timerinterrupt()
 {
 }
+
 
 /* the following rouytine will be called once (only) before any other */
 /* entity B routines are called. You can use it to do any initialization */
@@ -251,7 +382,7 @@ init()                         /* initialize the simulator */
     printf("It is likely that random number generation on your machine\n" ); 
     printf("is different from what this emulator expects.  Please take\n");
     printf("a look at the routine jimsrand() in the emulator code. Sorry. \n");
-    exit();
+    exit(0);
     }
 
    ntolayer3 = 0;
@@ -269,7 +400,7 @@ init()                         /* initialize the simulator */
 /****************************************************************************/
 float jimsrand() 
 {
-  double mmm = 2147483647;   /* largest int  - MACHINE DEPENDENT!!!!!!!!   */
+  double mmm = 65535;   /* largest int  - MACHINE DEPENDENT!!!!!!!!   */
   float x;                   /* individual students may need to change mmm */ 
   x = rand()/mmm;            /* x should be uniform in [0,1] */
   return(x);
@@ -283,7 +414,6 @@ generate_next_arrival()
 {
    double x,log(),ceil();
    struct event *evptr;
-    char *malloc();
    float ttime;
    int tempint;
 
@@ -394,7 +524,6 @@ float increment;
 
  struct event *q;
  struct event *evptr;
- char *malloc();
 
  if (TRACE>2)
     printf("          START TIMER: starting timer at %f\n",time);
@@ -422,7 +551,6 @@ struct pkt packet;
 {
  struct pkt *mypktptr;
  struct event *evptr,*q;
- char *malloc();
  float lastime, x, jimsrand();
  int i;
 
